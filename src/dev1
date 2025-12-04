@@ -1,0 +1,254 @@
+/*
+    Code developed for an Arduino R4 WIFI
+*/
+
+#include <WiFiS3.h>
+#include <WiFiUdp.h>
+#include <IRremote.hpp>
+#include <Servo.h>
+
+// =========== PHYSICAL ===========
+const byte IR_RECEIVE_PIN = 2;  // We wired S to D2
+Servo myservo;
+// =========== END PHYSICAL ===========
+
+
+// ======= WIFI / UDP CONFIG =======
+const char* WIFI_SSID     = "BlueHouse";
+const char* WIFI_PASSWORD = "dynamicink599";
+const uint16_t UDP_PORT   = 4210;
+IPAddress broadcastIp(192, 168, 86, 255);
+const char* DEVICE_ID = "dev1";
+WiFiUDP udp;
+const size_t UDP_BUFFER_SIZE = 256;
+char incomingBuffer[UDP_BUFFER_SIZE];
+// ======= END WIFI / UDP CONFIG =======
+
+
+// =========== HELPERS ===========
+// Connect to WIFI
+void connectWiFi() {
+  Serial.print("[");
+  Serial.print(DEVICE_ID);
+  Serial.print("] Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  int status = WL_IDLE_STATUS;
+  // Attempt to connect until we get WL_CONNECTED or timeout-ish
+  int attempts = 0;
+  while (status != WL_CONNECTED && attempts < 40) {
+    status = WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    attempts++;
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (status == WL_CONNECTED) {
+    Serial.print("[");
+    Serial.print(DEVICE_ID);
+    Serial.print("] WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.print("[");
+    Serial.print(DEVICE_ID);
+    Serial.println("] WiFi connection FAILED.");
+  }
+}
+
+// Parse incoming commands to break into understandable fields
+String extractField(const String& msg, const String& key) {
+  String pattern = key + "=";
+  int start = msg.indexOf(pattern);
+  if (start == -1) return "";
+
+  start += pattern.length();
+  int end = msg.indexOf(';', start);
+  if (end == -1) {
+    end = msg.length();
+  }
+  return msg.substring(start, end);
+}
+
+// Put together an ACK to send back out
+void sendAck(const IPAddress& controllerIp,
+             uint16_t controllerPort,
+             const String& origin,
+             const String& cmdId,
+             const String& status,
+             const String& scheduled,
+             const String& recurring,
+             const String& nextTime) {
+  String ackMsg = "ACK;origin=" + origin +
+                  ";id=" + cmdId +
+                  ";device=" + String(DEVICE_ID) +
+                  ";status=" + status +
+                  ";scheduled=" + scheduled +
+                  ";recurring=" + recurring +
+                  ";next=" + nextTime;
+
+  udp.beginPacket(controllerIp, controllerPort);
+  udp.print(ackMsg);
+  udp.endPacket();
+
+  Serial.print("[");
+  Serial.print(DEVICE_ID);
+  Serial.print("] Sent ACK: ");
+  Serial.println(ackMsg);
+}
+
+// Servo instructions to close the door
+void closeDoor(){
+  myservo.write(0);
+  delay(1000);
+  myservo.write(180);
+}
+// =========== END HELPERS ===========
+
+
+// =========== SETUP ===========
+void setup() {
+  myservo.attach(9);
+
+  Serial.begin(9600); // Allows us to monitor serial outputs for logging and debugging via Arduino-IDE
+  while (!Serial) {
+    ; // wait for serial to connect
+  }
+
+  /* // Sniffing IR Remote button commands
+  Serial.println("IR Receiver test. Point remote and press buttons...");
+  IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK); // LED flickers on receive
+  */
+  
+  // Activate WIFI capability
+  connectWiFi();
+  if (udp.begin(UDP_PORT)) {
+    Serial.print("[");
+    Serial.print(DEVICE_ID);
+    Serial.print("] Listening on UDP port ");
+    Serial.println(UDP_PORT);
+  } else {
+    Serial.print("[");
+    Serial.print(DEVICE_ID);
+    Serial.println("] Failed to start UDP listener!");
+  }
+}
+// =========== END SETUP ===========
+
+
+// =========== LOOPING CODE ===========
+void loop() {
+  // If any IR command detected, pick it up and output to Serial Monitor
+  if (IrReceiver.decode()) {
+    Serial.print("  Command: ");
+    Serial.print(IrReceiver.decodedIRData.command);
+    // If understood to be precoded "1" button, then close the door
+    if(IrReceiver.decodedIRData.command == 12){ // "1" button on IR Remote
+      Serial.print(IrReceiver.decodedIRData.command);
+      closeDoor();
+    }
+    IrReceiver.resume(); // ready for the next code
+  }
+
+  // Reconnect Wi-Fi if needed
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.print("[");
+    Serial.print(DEVICE_ID);
+    Serial.println("] WiFi lost, reconnecting...");
+    connectWiFi();
+  }
+  
+  // Check for incoming UDP packets
+  int packetSize = udp.parsePacket();
+  if (packetSize > 0) {
+    int len = udp.read(incomingBuffer, UDP_BUFFER_SIZE - 1);
+    if (len > 0) {
+      incomingBuffer[len] = '\0';
+    }
+    String msg = String(incomingBuffer);
+
+    IPAddress senderIp  = udp.remoteIP();
+    uint16_t senderPort = udp.remotePort();
+
+    Serial.print("[");
+    Serial.print(DEVICE_ID);
+    Serial.print("] Received UDP from ");
+    Serial.print(senderIp);
+    Serial.print(":");
+    Serial.print(senderPort);
+    Serial.print(" -> ");
+    Serial.println(msg);
+
+    // Expect controller messages like:
+    // CMD;id=123;target=dev1;action=CLOSE_DOOR
+    if (msg.startsWith("CMD;")) {
+      String origin    = extractField(msg, "origin");
+      String cmdId  = extractField(msg, "id");
+      String target = extractField(msg, "target");
+      String action = extractField(msg, "action");
+      String scheduled = extractField(msg, "scheduled"); // "0" or "1"
+      String recurring = extractField(msg, "recurring"); // "0" or "1"
+      String nextTime  = extractField(msg, "next");      // "NONE" or timestamp
+
+      // Serial print for debugging - all of this will be 
+      Serial.print("[");
+      Serial.print(DEVICE_ID);
+      Serial.print("] CMD parsed: origin=");
+      Serial.print(origin);
+      Serial.print(", id=");
+      Serial.print(cmdId);
+      Serial.print(", target=");
+      Serial.print(target);
+      Serial.print(", action=");
+      Serial.print(action);
+      Serial.print(", scheduled=");
+      Serial.print(scheduled);
+      Serial.print(", recurring=");
+      Serial.print(recurring);
+      Serial.print(", next=");
+      Serial.println(nextTime);
+
+      // Check if this command is for me (or ALL)
+      if (target == DEVICE_ID || target == "ALL") {
+        Serial.print("[");
+        Serial.print(DEVICE_ID);
+        Serial.print("] Command for me. action=");
+        Serial.println(action);
+
+        // If "CLOSE_DOOR" then close the door
+        if (action == "CLOSE_DOOR") {
+          closeDoor();
+        }
+
+        // Send ACK back to controller
+        if (cmdId.length() > 0) {
+          String safeOrigin    = (origin.length()    > 0) ? origin    : "UNKNOWN";
+          String safeScheduled = (scheduled.length() > 0) ? scheduled : "0";
+          String safeRecurring = (recurring.length() > 0) ? recurring : "0";
+          String safeNext      = (nextTime.length() > 0) ? nextTime : "NONE";
+
+          sendAck(senderIp,
+                  senderPort,
+                  cmdId,
+                  "OK",
+                  safeScheduled,
+                  safeRecurring,
+                  safeNext);
+        }
+
+      } else {
+        Serial.print("[");
+        Serial.print(DEVICE_ID);
+        Serial.println("] Command not for me, ignoring.");
+      }
+    } else {
+      Serial.print("[");
+      Serial.print(DEVICE_ID);
+      Serial.println("] Unknown message type, ignoring.");
+    }
+  }
+
+  // Small delay to avoid super-tight loop
+  delay(5);
+}
+// =========== END LOOPING CODE ===========
