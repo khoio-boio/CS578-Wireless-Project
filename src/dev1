@@ -14,8 +14,8 @@ Servo myservo;
 
 
 // ======= WIFI / UDP CONFIG =======
-const char* WIFI_SSID     = "BlueHouse";
-const char* WIFI_PASSWORD = "dynamicink599";
+const char* WIFI_SSID     = "YOUR WIFI";
+const char* WIFI_PASSWORD = "YOUR WIFI PASSWORD";
 const uint16_t UDP_PORT   = 4210;
 IPAddress broadcastIp(192, 168, 86, 255);
 const char* DEVICE_ID = "dev1";
