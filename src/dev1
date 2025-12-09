@@ -23,11 +23,12 @@ Servo myservo;                   // Servo to actuate the door
 /* ============================================================================
  *  WIFI / UDP CONFIGURATION
  * ============================================================================ */
-const char* WIFI_SSID     = "YOUR_WIFI";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID     = "lefish";
+const char* WIFI_PASSWORD = "oogabooga";
 const uint16_t UDP_PORT   = 4210;                    // Port for all communication
-IPAddress broadcastIp(192, 168, 86, 255);            // Local subnet broadcast
+IPAddress broadcastIp(172, 20, 10, 15);            // Local subnet broadcast
 const char* DEVICE_ID = "dev1";                      // This device's identity tag
+bool isSleeping = false;
 
 WiFiUDP udp;
 const size_t UDP_BUFFER_SIZE = 256;
@@ -92,19 +93,21 @@ void sendAck(const IPAddress& controllerIp,
              const String& status,
              const String& scheduled,
              const String& recurring,
-             const String& nextTime) {
+             const String& nextTime,
+             const String& extraFields = "") {
+  // Build base ACK message
+  String ackMsg = "ACK;origin=" + origin +
+                  ";id=" + cmdId +
+                  ";device=" + String(DEVICE_ID) +
+                  ";status=" + status +
+                  ";scheduled=" + scheduled +
+                  ";recurring=" + recurring +
+                  ";next=" + nextTime;
 
-  // Build ACK message
-  String ackMsg =
-    "ACK;origin=" + origin +
-    ";id=" + cmdId +
-    ";device=" + String(DEVICE_ID) +
-    ";status=" + status +
-    ";scheduled=" + scheduled +
-    ";recurring=" + recurring +
-    ";next=" + nextTime;
+  // Optional extra fields, e.g. ";state=ASLEEP;uptime_ms=1234;rssi=-60"
+  ackMsg += extraFields;
 
-  // Broadcast ACK back on the same UDP port
+  // Broadcast ACK on the standard port
   udp.beginPacket(broadcastIp, UDP_PORT);
   udp.print(ackMsg);
   udp.endPacket();
@@ -114,6 +117,7 @@ void sendAck(const IPAddress& controllerIp,
   Serial.print("] Sent ACK: ");
   Serial.println(ackMsg);
 }
+
 
 /* ============================================================================
  *  DOOR ACTIONS
@@ -240,50 +244,127 @@ void loop() {
       Serial.print(", next=");
       Serial.println(nextTime);
 
-      // Check if the device should respond
+            // Check if this command is for me (or ALL)
       if (target == DEVICE_ID || target == "ALL") {
+        Serial.print("[");
+        Serial.print(DEVICE_ID);
+        Serial.print("] Command for me. action=");
+        Serial.println(action);
 
-        bool recognized = false;
+        bool recognized        = false;
+        String status          = "UNKNOWN_ACTION";
+        String extraFields     = "";   // for STATUS metrics
 
-        // Supported action
-        if (action == "CLOSE_DOOR") {
-          closeDoor();
+        // -------------------------------
+        // Special commands (always obey)
+        // -------------------------------
+
+        if (action == "SLEEP") {
+          // Enter sleep mode: ignore physical actions until WAKEUP
+          isSleeping = true;
           recognized = true;
+          status     = "OK";
+
+          Serial.print("[");
+          Serial.print(DEVICE_ID);
+          Serial.println("] Entering SLEEP mode.");
+
+        } else if (action == "WAKEUP") {
+          // Exit sleep mode
+          isSleeping = false;
+          recognized = true;
+          status     = "OK";
+
+          Serial.print("[");
+          Serial.print(DEVICE_ID);
+          Serial.println("] Waking up (leaving SLEEP mode).");
+
+        } else if (action == "STATUS") {
+          // STATUS always responds, regardless of sleep
+          recognized = true;
+          status     = "STATUS_OK";
+
+          // Gather basic metrics
+          unsigned long uptime = millis();
+          long rssi = WiFi.RSSI();
+          const char* stateStr = isSleeping ? "ASLEEP" : "AWAKE";
+
+          extraFields =
+            ";state="     + String(stateStr) +
+            ";uptime_ms=" + String(uptime) +
+            ";rssi="      + String(rssi);
+
+          Serial.print("[");
+          Serial.print(DEVICE_ID);
+          Serial.print("] STATUS requested. state=");
+          Serial.print(stateStr);
+          Serial.print(", uptime_ms=");
+          Serial.print(uptime);
+          Serial.print(", rssi=");
+          Serial.println(rssi);
+
+        // -------------------------------
+        // Normal action commands
+        // -------------------------------
+        } else if (action == "CLOSE_DOOR") {
+          recognized = true;
+
+          if (isSleeping) {
+            // Valid command, but we are asleep → DO NOT move servo
+            status = "ASLEEP_NO_ACTION";
+
+            Serial.print("[");
+            Serial.print(DEVICE_ID);
+            Serial.println("] CLOSE_DOOR received but device is ASLEEP. No action taken.");
+          } else {
+            // Normal behavior: perform the action
+            closeDoor();
+            status = "OK";
+
+            Serial.print("[");
+            Serial.print(DEVICE_ID);
+            Serial.println("] CLOSE_DOOR executed.");
+          }
+
         } else {
+          // Unknown/unsupported action
+          recognized = false;
+          status     = "UNKNOWN_ACTION";
+
           Serial.print("[");
           Serial.print(DEVICE_ID);
           Serial.print("] WARNING: Unknown action '");
           Serial.print(action);
-          Serial.println("', ignoring.");
+          Serial.println("' – no movement performed.");
         }
 
-        // Send ACK
+        // Send ACK back to sender
         if (cmdId.length() > 0) {
-          String safeOrigin    = origin.length()    ? origin    : "UNKNOWN";
-          String safeSched     = scheduled.length() ? scheduled : "0";
-          String safeRecur     = recurring.length() ? recurring : "0";
-          String safeNext      = nextTime.length()  ? nextTime  : "NONE";
-          String status        = recognized ? "OK" : "UNKNOWN_ACTION";
+          String safeOrigin    = (origin.length()    > 0) ? origin    : "UNKNOWN";
+          String safeScheduled = (scheduled.length() > 0) ? scheduled : "0";
+          String safeRecurring = (recurring.length() > 0) ? recurring : "0";
+          String safeNext      = (nextTime.length()  > 0) ? nextTime  : "NONE";
 
-          sendAck(senderIp, senderPort,
-                  safeOrigin, cmdId, status,
-                  safeSched, safeRecur, safeNext);
+          sendAck(senderIp,
+                  senderPort,
+                  safeOrigin,
+                  cmdId,
+                  status,
+                  safeScheduled,
+                  safeRecurring,
+                  safeNext,
+                  extraFields);
         }
 
       } else {
         Serial.print("[");
         Serial.print(DEVICE_ID);
-        Serial.println("] CMD not for me — ignored.");
+        Serial.println("] Command not for me, ignoring.");
       }
-
-    } else {
-      Serial.print("[");
-      Serial.print(DEVICE_ID);
-      Serial.println("] Unknown message format — ignored.");
     }
-  }
 
   delay(5);  // Prevent CPU hogging
+  }
 }
 
 /* ============================================================================
